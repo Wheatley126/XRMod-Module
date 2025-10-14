@@ -1779,6 +1779,31 @@ LUA_FUNCTION(GetTrackedDeviceNames) {
 	return 1;
 }
 
+LUA_FUNCTION(GetInteractionProfile) {
+	if(!g_SessionStarted)
+		LUA->ThrowError("XRMod Error: Tried to retrieve interaction profile with no session active");
+
+	XrInteractionProfileState state{XR_TYPE_INTERACTION_PROFILE_STATE,nullptr};
+
+	const char* userPath;
+	if(LUA->GetType(-1) == GarrysMod::Lua::Type::STRING)
+		userPath = LUA->GetString(-1);
+	else
+		userPath = "/user/hand/left";
+
+	XrPath controllerPath = CreateXrPath(userPath);
+	XrResult result = xrGetCurrentInteractionProfile(g_Session,controllerPath,&state);
+	if(XR_FAILED(result))
+		LUA->ThrowError(GetResultString("XRMod Error: Failed to retrieve interaction profile (%s)",result));
+
+	char profilePath[MAX_STR_LEN];
+	uint32_t length;
+	xrPathToString(g_Instance,state.interactionProfile,MAX_STR_LEN,&length,profilePath);
+	LUA->PushString(profilePath,length);
+
+	return 1;
+}
+
 GMOD_MODULE_OPEN(){
 	LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
 	LUA->GetField(-1, "vrmod");
@@ -1841,6 +1866,9 @@ GMOD_MODULE_OPEN(){
 
 		LUA->PushCFunction(GetTrackedDeviceNames);
 		LUA->SetField(-2, "GetTrackedDeviceNames");
+
+		LUA->PushCFunction(GetInteractionProfile);
+		LUA->SetField(-2, "GetInteractionProfile");
 
 		LUA->SetField(-2, "vrmod");
 
