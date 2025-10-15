@@ -14,14 +14,17 @@
 	#include <d3d9.h>
 	#include <d3d11.h>
 	#define PATH_MAX MAX_PATH
+	#define XR_USE_PLATFORM_WIN32
 #else
 	#include <GL/gl.h>
 	#include <sys/mman.h>
 	#include <dlfcn.h>
 	#include <unistd.h>
+	#include <time.h>
+	#define XR_USE_TIMESPEC
 #endif
 
-#define VRMOD_MODULE_VERSION 23
+#define XRMOD_MODULE_VERSION 1
 
 #define MAX_STR_LEN     256
 #define MAX_ACTIONS     64
@@ -85,8 +88,10 @@ int                     g_actionCount = 0;
 uint32_t g_TextureWidth = 0;
 uint32_t g_TextureHeight = 0;
 XrSwapchain				g_Swapchain = XR_NULL_HANDLE;
-std::vector<const XrCompositionLayerBaseHeader*> g_Layers = {};
 XrFrameState g_FrameState{XR_TYPE_FRAME_STATE,nullptr};
+
+XrTime g_lastPredictedFrameTime = 0;
+int predictionScale = 0; // Percentage of original prediction amount to use
 
 int                     g_luaRefs[LuaRefIndex_Max];
 int                     g_luaRefCount = 0;
@@ -153,10 +158,15 @@ char                    g_createTextureOrigBytes[14];
 
 #endif
 
-#include <openxr/openxr_platform.h>
-
 #ifdef DEBUG
 	#define XR_EXTENSION_PROTOTYPES
+#endif
+#include <openxr/openxr_platform.h>
+
+#ifdef _WIN32
+	PFN_xrConvertWin32PerformanceCounterToTimeKHR ConvertSysTimeToXrTime = nullptr;
+#else
+	PFN_xrConvertTimespecTimeToTimeKHR ConvertSysTimeToXrTime = nullptr;
 #endif
 
 // Swapchain image lists have to be defined after platform-specific info
@@ -170,6 +180,30 @@ XrPath CreateXrPath(const char* pathString) {
 	XrPath path;
 	xrStringToPath(g_Instance,pathString,&path);
 	return path;
+}
+
+PFN_xrVoidFunction getXRFunction(const char* name)
+{
+	PFN_xrVoidFunction func;
+
+	if(XR_FAILED(xrGetInstanceProcAddr(g_Instance, name, &func)))
+		return XR_NULL_HANDLE;
+	
+	return func;
+}
+
+void SetupPrototypeFunctions()
+{
+	#ifdef _WIN32
+		ConvertSysTimeToXrTime = (PFN_xrConvertWin32PerformanceCounterToTimeKHR) getXRFunction("xrConvertWin32PerformanceCounterToTimeKHR");
+	#else
+		ConvertSysTimeToXrTime = (PFN_xrConvertTimespecTimeToTimeKHR) getXRFunction("xrConvertTimespecTimeToTimeKHR");
+	#endif
+}
+
+void ClearPrototypeFunctions()
+{
+	ConvertSysTimeToXrTime = nullptr;
 }
 
 QAngle QuatToAngle(XrQuaternionf q) {
@@ -230,18 +264,23 @@ void PrintConsoleText(char* str, GarrysMod::Lua::ILuaBase *LUA) {
 }
 
 
+
 XrResult RefreshInstance() {
 	XrInstanceCreateInfo createInfo{XR_TYPE_INSTANCE_CREATE_INFO,nullptr};
 
 	std::vector<const char*> extensions = {};
+
 	#ifdef _WIN32
 		extensions.push_back(XR_KHR_D3D11_ENABLE_EXTENSION_NAME);
+		extensions.push_back(XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME);
 	#else
 		extensions.push_back(XR_KHR_OPENGL_ENABLE_EXTENSION_NAME);
+		extensions.push_back(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME);
 	#endif
 	#ifdef DEBUG
 		extensions.push_back(XR_EXT_DEBUG_UTILS_EXTENSION_NAME);
 	#endif
+
 	createInfo.enabledExtensionCount = (uint32_t) extensions.size();
 	createInfo.enabledExtensionNames = extensions.data();
 
@@ -262,17 +301,12 @@ XrResult RefreshInstance() {
 	createInfo.applicationInfo = appInfo;
 	createInfo.createFlags = 0;
 
-	return xrCreateInstance(&createInfo,&g_Instance);
-}
-
-PFN_xrVoidFunction getXRFunction(const char* name)
-{
-	PFN_xrVoidFunction func;
-
-	if(XR_FAILED(xrGetInstanceProcAddr(g_Instance, name, &func)))
-		return XR_NULL_HANDLE;
+	XrResult result = xrCreateInstance(&createInfo,&g_Instance);
+	if(XR_FAILED(result))
+		return result;
 	
-	return func;
+	SetupPrototypeFunctions();
+	return result;
 }
 
 #ifdef DEBUG
@@ -352,7 +386,7 @@ bool CreateDebugMessenger(GarrysMod::Lua::ILuaBase *LUA)
     debugMessengerCreateInfo.userCallback = (PFN_xrDebugUtilsMessengerCallbackEXT) handleXRError;
     debugMessengerCreateInfo.userData = nullptr;
 
-	auto xrCreateDebugUtilsMessengerEXT = (PFN_xrCreateDebugUtilsMessengerEXT) getXRFunction("xrCreateDebugUtilsMessengerEXT");
+	PFN_xrCreateDebugUtilsMessengerEXT xrCreateDebugUtilsMessengerEXT = (PFN_xrCreateDebugUtilsMessengerEXT) getXRFunction("xrCreateDebugUtilsMessengerEXT");
 
 	if(XR_FAILED(xrCreateDebugUtilsMessengerEXT(g_Instance, &debugMessengerCreateInfo, &debugMessenger)))
 	{
@@ -430,11 +464,12 @@ void ClearSession(GarrysMod::Lua::ILuaBase *LUA) {
 	}
 	
 	g_SwapchainImages.clear();
-	g_Layers.clear();
 
 	g_FrameState.shouldRender = XR_FALSE;
 	g_FrameState.predictedDisplayPeriod = 0;
 	g_FrameState.predictedDisplayTime = 0;
+
+	g_lastPredictedFrameTime = 0;
 
 
 	for(int i = 0; i < g_luaRefCount; i++)
@@ -461,7 +496,7 @@ void ClearSession(GarrysMod::Lua::ILuaBase *LUA) {
 
 // Doesn't need changing
 LUA_FUNCTION(GetVersion) {
-	LUA->PushNumber(VRMOD_MODULE_VERSION);
+	LUA->PushNumber(XRMOD_MODULE_VERSION);
 
 	return 1;
 }
@@ -769,7 +804,7 @@ LUA_FUNCTION(CreateActionSet) {
 		{
 			action* act = &g_actions[g_actionCount];
 			XrResult result = xrCreateAction(set->handle,&createInfo,&(act->handle));
-			if(result != XR_SUCCESS)
+			if(XR_FAILED(result))
 				LUA->ThrowError(GetResultString("XRMod Error: Failed to create action (%s)",result));
 
 			act->type = createInfo.actionType;
@@ -782,8 +817,9 @@ LUA_FUNCTION(CreateActionSet) {
 				spaceCreateInfo.poseInActionSpace = XR_IDENTITYPOSE;
 				spaceCreateInfo.subactionPath = XR_NULL_PATH;
 
-				if(XR_FAILED(xrCreateActionSpace(g_Session,&spaceCreateInfo,&(act->space))))
-					PrintConsoleText("XRMod: Failed to create action space",LUA);
+				result = xrCreateActionSpace(g_Session,&spaceCreateInfo,&(act->space));
+				if(XR_FAILED(result))
+					PrintConsoleText(GetResultString("XRMod Error: Failed to create action space (%s)",result),LUA);
 			} else act->space = XR_NULL_HANDLE;
 
 			for(int i = 0; i < 2; i++) {
@@ -1103,6 +1139,7 @@ LUA_FUNCTION(GetDisplayInfo) {
 	LUA->PushNumber(hFov * RAD2DEG);
 	LUA->SetField(-2, "FovLeft");
 
+	// TODO: Try using the max angle instead
 	hFov = abs(views[1].fov.angleRight - views[1].fov.angleLeft);
 	vFov = abs(views[1].fov.angleUp - views[1].fov.angleDown);
 	aspect = tan(hFov / 2) / tan(vFov / 2);
@@ -1390,11 +1427,6 @@ LUA_FUNCTION(ShareTextureFinish) {
 	if(XR_FAILED(result))
 		LUA->ThrowError(GetResultString("XRMod Error: Failed to retreive number of required swapchain images (%s)",result));
 
-	// Debug text
-	char countStr[MAX_STR_LEN];
-	snprintf(countStr,MAX_STR_LEN,"Total Swapchain images: %d",imageCount);
-	PrintConsoleText(countStr,LUA);
-
 	g_SwapchainImages.resize(imageCount);
 	for(int i = 0; i < imageCount; i++)
 	{
@@ -1412,32 +1444,6 @@ LUA_FUNCTION(ShareTextureFinish) {
 	result = xrEnumerateSwapchainImages(g_Swapchain,imageCount,&imageCount,(XrSwapchainImageBaseHeader*) g_SwapchainImages.data());
 	if(XR_FAILED(result))
 		LUA->ThrowError(GetResultString("XRMod Error: Failed to enumerate swapchain images (%s)",result));
-
-	// Create Composition Layers
-	XrFovf placeFov{0.f,0.f,0.f,0.f};
-	XrPosef placePose = XR_IDENTITYPOSE;
-
-	XrCompositionLayerProjection project{XR_TYPE_COMPOSITION_LAYER_PROJECTION,nullptr};
-	project.views = nullptr;
-	project.viewCount = 2;
-	project.layerFlags = 0;
-	project.space = g_SpaceStage;
-
-	g_Layers.push_back((XrCompositionLayerBaseHeader*) &project);
-
-	return 0;
-}
-
-// Will most likely remove
-LUA_FUNCTION(SetSubmitTextureBounds) {
-	/*g_textureBoundsLeft.uMin = (float)LUA->CheckNumber(1);
-	g_textureBoundsLeft.vMin = (float)LUA->CheckNumber(2);
-	g_textureBoundsLeft.uMax = (float)LUA->CheckNumber(3);
-	g_textureBoundsLeft.vMax = (float)LUA->CheckNumber(4);
-	g_textureBoundsRight.uMin = (float)LUA->CheckNumber(5);
-	g_textureBoundsRight.vMin = (float)LUA->CheckNumber(6);
-	g_textureBoundsRight.uMax = (float)LUA->CheckNumber(7);
-	g_textureBoundsRight.vMax = (float)LUA->CheckNumber(8);*/
 
 	return 0;
 }
@@ -1507,37 +1513,44 @@ uint8_t PollEvents(GarrysMod::Lua::ILuaBase *LUA) {
 	return 0;
 }
 
-void UpdateLayers(XrView* viewInfo) {
-	std::vector<XrCompositionLayerProjectionView> projectViews = {};
+const XrCompositionLayerProjection CreateLayer(XrView* viewInfo) {
+	std::vector<XrCompositionLayerProjectionView> projectViews;
 	projectViews.resize(2);
 
 	for(int i = 0; i < 2; i++)
 	{
-		XrCompositionLayerProjectionView projectView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,nullptr};
-		projectView.fov = viewInfo[i].fov;
-		projectView.pose = viewInfo[i].pose;
+		XrCompositionLayerProjectionView* projectView = &projectViews[i];
+		projectView->type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+		projectView->next = nullptr;
+		projectView->fov = viewInfo[i].fov;
+		projectView->pose = viewInfo[i].pose;
 
-		projectView.subImage.swapchain = g_Swapchain;
-		projectView.subImage.imageArrayIndex = 0;
-		projectView.subImage.imageRect.extent.width = g_TextureWidth;
-		projectView.subImage.imageRect.extent.height = g_TextureHeight;
+		projectView->subImage.swapchain = g_Swapchain;
+		projectView->subImage.imageArrayIndex = 0;
+		projectView->subImage.imageRect.extent.width = g_TextureWidth;
+		projectView->subImage.imageRect.extent.height = g_TextureHeight;
 
 		if(i == 0)
-			projectView.subImage.imageRect.offset.x = 0;
+			projectView->subImage.imageRect.offset.x = 0;
 		else
-			projectView.subImage.imageRect.offset.x = g_TextureWidth;
-		projectView.subImage.imageRect.offset.y = 0;
-
-		projectViews[i] = projectView;
+			projectView->subImage.imageRect.offset.x = g_TextureWidth;
+		projectView->subImage.imageRect.offset.y = 0;
 	}
 
-	XrCompositionLayerProjection project{XR_TYPE_COMPOSITION_LAYER_PROJECTION,nullptr};
-	project.views = projectViews.data();
+	const XrCompositionLayerProjection project{
+		XR_TYPE_COMPOSITION_LAYER_PROJECTION,
+		nullptr,
+		0,
+		g_SpaceStage,
+		projectViews.size(),
+		projectViews.data()
+	};
+	/*project.views = projectViews;
 	project.viewCount = 2;
 	project.layerFlags = 0;
-	project.space = g_SpaceStage;
+	project.space = g_SpaceStage;*/
 
-	g_Layers[0] = (const XrCompositionLayerBaseHeader*) &project;
+	return project;
 }
 
 void EndFrameFail() {
@@ -1548,6 +1561,36 @@ void EndFrameFail() {
 	frameEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 
 	xrEndFrame(g_Session,&frameEndInfo);
+}
+
+XrTime DampenPrediction(XrTime predictedTime)
+{
+	// Dampen frame time predictions
+	#ifdef _WIN32
+		LARGE_INTEGER time;
+		QueryPerformanceCounter(&time);
+	#else
+		timespec time;
+		clock_gettime(CLOCK_MONOTONIC,&time);
+	#endif
+
+	XrTime timeXr;
+	ConvertSysTimeToXrTime(g_Instance,&time,&timeXr);
+
+	XrTime predictionAmount = predictedTime - timeXr;
+	if (predictionAmount > 0) {
+		predictedTime = timeXr + (predictionScale * predictionAmount) / 100;
+	}
+	predictedTime = max(predictedTime, g_lastPredictedFrameTime + 1);
+	g_lastPredictedFrameTime = predictedTime;
+
+	return predictedTime;
+}
+
+LUA_FUNCTION(SetPredictionScale) {
+	LUA->CheckType(-1,GarrysMod::Lua::Type::NUMBER);
+	predictionScale = LUA->GetNumber();
+	return 0;
 }
 
 bool CallInGameRenderFunc(XrPosef eyeLeft, XrPosef eyeRight, GarrysMod::Lua::ILuaBase *LUA) {
@@ -1610,14 +1653,19 @@ LUA_FUNCTION(DoRenderLoop) {
 		}
 	#endif*/
 
+	XrFrameState frameState{XR_TYPE_FRAME_STATE,nullptr};
+
 	// xrWaitFrame -> xrBeginFrame -> xrEndFrame
 	//XrFrameWaitInfo frameWaitInfo{XR_TYPE_FRAME_WAIT_INFO,nullptr};
-	XrResult result = xrWaitFrame(g_Session, nullptr, &g_FrameState);
+	XrResult result = xrWaitFrame(g_Session, nullptr, &frameState);
 	if(XR_FAILED(result))
 	{
 		EndFrameFail();
 		LUA->ThrowError(GetResultString("XRMod Error: xrWaitFrame failed (%s)",result));
 	}
+	g_FrameState = frameState;
+
+	XrTime dampenedDisplayTime = DampenPrediction(frameState.predictedDisplayTime);
 
 	//XrFrameBeginInfo frameBeginInfo{XR_TYPE_FRAME_BEGIN_INFO,nullptr};
 	result = xrBeginFrame(g_Session, nullptr);
@@ -1631,7 +1679,7 @@ LUA_FUNCTION(DoRenderLoop) {
 	XrViewLocateInfo viewLocateInfo{XR_TYPE_VIEW_LOCATE_INFO,nullptr};
 	viewLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 	viewLocateInfo.space = g_SpaceStage;
-	viewLocateInfo.displayTime = g_FrameState.predictedDisplayTime;
+	viewLocateInfo.displayTime = dampenedDisplayTime;
 
 	XrViewState viewState{XR_TYPE_VIEW_STATE,nullptr};
 
@@ -1645,7 +1693,7 @@ LUA_FUNCTION(DoRenderLoop) {
 	}
 
 	// Render here
-	if(g_FrameState.shouldRender == XR_TRUE)
+	if(frameState.shouldRender == XR_TRUE)
 	{
 		bool bSuccess = CallInGameRenderFunc(views[0].pose, views[1].pose, LUA);
 		if(!bSuccess) {
@@ -1694,13 +1742,14 @@ LUA_FUNCTION(DoRenderLoop) {
 		LUA->ThrowError(GetResultString("XRMod: Failed to release swapchain image (%s)",result));
 	}
 
-	// Update composition layers
-	UpdateLayers((XrView*) &views);
+	// Set up composition layers
+	const XrCompositionLayerProjection project = CreateLayer((XrView*) &views);
+	std::vector<const XrCompositionLayerBaseHeader*> layers = { (const XrCompositionLayerBaseHeader*) &project };
 
 	XrFrameEndInfo frameEndInfo{XR_TYPE_FRAME_END_INFO,nullptr};
-	frameEndInfo.displayTime = g_FrameState.predictedDisplayTime;
-	frameEndInfo.layers = g_Layers.data();
-	frameEndInfo.layerCount = g_Layers.size();
+	frameEndInfo.displayTime = frameState.predictedDisplayTime;
+	frameEndInfo.layers = layers.data();
+	frameEndInfo.layerCount = layers.size();
 	frameEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 
 	result = xrEndFrame(g_Session,&frameEndInfo);
@@ -1711,8 +1760,9 @@ LUA_FUNCTION(DoRenderLoop) {
 	return 1;
 }
 
-LUA_FUNCTION(Finalize) {
+LUA_FUNCTION(AttachActionSets) {
 	// Despite what the name implies, you actually have to attach these individually
+	// TODO: Chat was she wrong about that?
 	for(int i = 0; i < g_actionSetCount; i++)
 	{
 		XrSessionActionSetsAttachInfo attachInfo{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO,nullptr};
@@ -1780,8 +1830,8 @@ LUA_FUNCTION(GetTrackedDeviceNames) {
 }
 
 LUA_FUNCTION(GetInteractionProfile) {
-	if(!g_SessionStarted)
-		LUA->ThrowError("XRMod Error: Tried to retrieve interaction profile with no session active");
+	if(g_Session == XR_NULL_HANDLE)
+		LUA->ThrowError("XRMod Error: Tried to retrieve interaction profile without a valid session");
 
 	XrInteractionProfileState state{XR_TYPE_INTERACTION_PROFILE_STATE,nullptr};
 
@@ -1849,14 +1899,14 @@ GMOD_MODULE_OPEN(){
 		LUA->PushCFunction(ShareTextureFinish);
 		LUA->SetField(-2, "ShareTextureFinish");
 
-		LUA->PushCFunction(SetSubmitTextureBounds);
-		LUA->SetField(-2, "SetSubmitTextureBounds");
+		LUA->PushCFunction(SetPredictionScale);
+		LUA->SetField(-2, "SetPredictionScale");
 
 		LUA->PushCFunction(DoRenderLoop);
 		LUA->SetField(-2, "DoRenderLoop");
 
-		LUA->PushCFunction(Finalize);
-		LUA->SetField(-2, "Finalize");
+		LUA->PushCFunction(AttachActionSets);
+		LUA->SetField(-2, "AttachActionSets");
 
 		LUA->PushCFunction(Shutdown);
 		LUA->SetField(-2, "Shutdown");
@@ -1886,16 +1936,17 @@ GMOD_MODULE_CLOSE(){
 
 	if(g_Instance != XR_NULL_HANDLE)
 	{
-		#ifdef DEBUG xrDestroyDebugUtilsMessengerEXT
+		#ifdef DEBUG
 			if(debugGlobalMessenger != XR_NULL_HANDLE)
 			{
-				auto xrDestroyDebugUtilsMessengerEXT = (PFN_xrDestroyDebugUtilsMessengerEXT) getXRFunction("xrDestroyDebugUtilsMessengerEXT");
+				PFN_xrDestroyDebugUtilsMessengerEXT xrDestroyDebugUtilsMessengerEXT = (PFN_xrDestroyDebugUtilsMessengerEXT) getXRFunction("xrDestroyDebugUtilsMessengerEXT");
 				if(xrDestroyDebugUtilsMessengerEXT != XR_NULL_HANDLE)
 					xrDestroyDebugUtilsMessengerEXT(debugGlobalMessenger);
 			}
 		#endif
 
 		xrDestroyInstance(g_Instance);
+		ClearPrototypeFunctions();
 		g_Instance = XR_NULL_HANDLE;
 	}
 
