@@ -23,8 +23,8 @@ pause
 
 :build
 
-set CompilerFlags= -MT -nologo -Oi -O2 -W3 /wd4996 /I ..\deps
-set LinkerFlags= -INCREMENTAL:NO -opt:ref d3d11.lib USER32.LIB Shell32.lib /LIBPATH:..\deps\openxr /DLL
+set CompilerFlags= -MT -nologo -Oi -O2 -W3 /wd4996 /std:c++17 /I ..\deps /I ..\deps\garrysmod_common\include /I ..\deps\garrysmod_common\helpers\include /I ..\deps\garrysmod_common\helpers\source /I ..\deps\garrysmod_common\helpers_extended\include /I ..\deps\garrysmod_common\scanning\include\scanning /I ..\deps\garrysmod_common\scanning\source\windows /I ../deps/garrysmod_common/detouring/include/detouring  /I ../deps/garrysmod_common/detouring/source /I ..\deps\garrysmod_common\detouring\minhook\include /I ..\deps\garrysmod_common\detouring\minhook\src /I ..\deps\garrysmod_common\detouring\minhook\src\hde /I ..\deps\garrysmod_common\sourcesdk-minimal\public /I ..\deps\garrysmod_common\sourcesdk-minimal\public\tier0 /I ..\deps\garrysmod_common\sourcesdk-minimal\public\tier1 /I ..\deps\garrysmod_common\sourcesdk-minimal\tier2
+set LinkerFlags= -INCREMENTAL:NO -opt:ref d3d11.lib USER32.LIB Shell32.lib /LIBPATH:..\deps\garrysmod_common /LIBPATH:..\deps\openxr /DLL
 
 if not exist output\ mkdir output
 
