@@ -56,7 +56,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
-#include <mathlib/mathlib.h>
+//#include <mathlib/mathlib_base.cpp>
 #include <mathlib/vmatrix.h>
 #include <color.h>
 #include <materialsystem/imaterialsystem.h>
@@ -1973,7 +1973,8 @@ const double minPitch = 0;
 const double maxPitch = 180.0 * DEG2RAD;
 const double pitchRange = maxPitch - minPitch;
 LUA_FUNCTION(GetFingercurls) {
-	if(!g_SessionStarted || !g_hasHandTracking)
+	return 0;
+	/*if(!g_SessionStarted || !g_hasHandTracking)
 		return 0;
 
 	XrHandJointsLocateInfoEXT locateInfo{XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT,nullptr};
@@ -2033,7 +2034,7 @@ LUA_FUNCTION(GetFingercurls) {
 
 			/*QuatInvert(j1->pose.orientation,inverse);
 			QuatMul(inverse,j2->pose.orientation,offset);*/
-			Quaternion q1 = {
+			/*Quaternion q1 = {
 				j1->pose.orientation.x,
 				j1->pose.orientation.y,
 				j1->pose.orientation.z,
@@ -2057,11 +2058,11 @@ LUA_FUNCTION(GetFingercurls) {
 			}
 
 			double curl = (pitch-minPitch)/pitchRange;
-			LUA->PushNumber(curl);
+			LUA->PushNumber(0);
 		}
 	}
 
-	return 10;
+	return 10;*/
 }
 
 LUA_FUNCTION(GetBodyTrackers) {
