@@ -5,11 +5,17 @@
 #include <stdint.h>
 #include <limits.h>
 #include <vector>
+#include <semaphore>
+#include <thread>
+#include <functional>
+#include <format>
 
 #include <GarrysMod/Lua/Interface.h>
 
 #include <ModuleLoader.cpp>
 #include <Garrysmod/FactoryLoader.hpp>
+#include <GarrysMod/Symbol.hpp>
+#include <symbolfinder.cpp>
 
 #include <hde32.c>
 #include <hde64.c>
@@ -23,7 +29,7 @@
 	#include <Windows.h>
 	#include <shellapi.h>
 	#include <d3d9.h>
-	#include <d3d11.h>
+	#include <d3d11_4.h>
 
 	#define PATH_MAX MAX_PATH
 	#define XR_USE_PLATFORM_WIN32
@@ -50,7 +56,9 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+#include <mathlib/mathlib.h>
 #include <mathlib/vmatrix.h>
+#include <color.h>
 #include <materialsystem/imaterialsystem.h>
 
 #define XRMOD_MODULE_VERSION 1
@@ -58,9 +66,10 @@
 #define MAX_STR_LEN     256
 #define MAX_ACTIONS     64
 #define MAX_ACTIONSETS  16
-#define PI            3.141592653589793116
+#define PI				3.141592653589793116
 
-const double RAD2DEG = 180.0/PI;
+#define RAD2DEG			(180.0/PI)
+#define DEG2RAD 		(PI/180.0)
 
 enum ELuaRefIndex{
 	LuaRefIndex_EmptyTable,
@@ -95,14 +104,24 @@ typedef struct QueuedPose {
 	XrPosef right;
 } QueuedPose;
 
+typedef ITexture* (*CreateNamedRenderTargetTextureEx)(IMaterialSystem*, const char *,
+		int, 
+		int, 
+		RenderTargetSizeMode_t,	// Controls how size is generated (and regenerated on video mode change).
+		ImageFormat, 
+		MaterialRenderTargetDepth_t, 
+		unsigned int,
+		unsigned int);
+
 //#define PushMatrix(mtx) LUA->PushUserType(&(mtx.m), GarrysMod::Lua::Type::MATRIX);
 
 const XrPosef XR_IDENTITYPOSE = { {0,0,0,1}, {0,0,0} };
 
-XrInstance             g_Instance = XR_NULL_HANDLE;
-XrSession              g_Session = XR_NULL_HANDLE;
+XrInstance				g_Instance = XR_NULL_HANDLE;
+bool					g_bUse1_0 = false;
+XrSession				g_Session = XR_NULL_HANDLE;
 bool					g_SessionStarted = false;
-XrSystemId              g_SystemId = XR_NULL_SYSTEM_ID;
+XrSystemId				g_SystemId = XR_NULL_SYSTEM_ID;
 
 XrSpace					g_SpaceStage = XR_NULL_HANDLE;
 XrSpace					g_SpaceView = XR_NULL_HANDLE;
@@ -125,9 +144,16 @@ std::vector<QueuedPose>	g_FramePoses = {};
 uint8_t frameSimulate = 0;
 uint8_t frameRender = 0;
 
+std::thread				g_tWaitThread;
+bool					g_bUseWaitThread = true;
+std::binary_semaphore	semaphoreRender{1};
+std::binary_semaphore	semaphoreSignal{0};
+
 // Swapchain image lists have to be defined after platform-specific info
 #ifdef _WIN32
 	std::vector<XrSwapchainImageD3D11KHR> g_SwapchainImages = {};
+
+	const Symbol sym_CreateRenderTarget = Symbol::FromSignature("\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10\x57\x48\x83\xec\x50\x48\x8b\x0d\x92\xdf\x0c\x02\x41\x8b");
 #else
 	std::vector<XrSwapchainImageOpenGLKHR> g_SwapchainImages = {};
 #endif
@@ -171,6 +197,7 @@ PFN_xrGetBodySkeletonFB		xrGetBodySkeletonFB = nullptr;
 
 char                    g_createTextureOrigBytes[14];
 IMaterialSystem*		g_pMatSys = nullptr;
+CreateNamedRenderTargetTextureEx fn_CreateNamedRenderTargetTextureEx = nullptr;
 
 #ifdef _WIN32
 
@@ -180,9 +207,12 @@ IMaterialSystem*		g_pMatSys = nullptr;
 	CreateTexture           g_createTexture = NULL;
 	Present					g_Present = NULL;
 
-	ID3D11Device*           g_d3d11Device = NULL;
-	ID3D11DeviceContext*	g_d3d11DeviceContext = NULL;
+	ID3D11Device5*          g_d3d11Device = NULL;
+	ID3D11DeviceContext4*	g_d3d11DeviceContext = NULL;
 	ID3D11Texture2D*        g_d3d11Texture = NULL;
+	ID3D11Fence*			g_d3d11Fence = NULL;
+	UINT64					g_d3d11FenceValue = 0Ui64;
+	HANDLE					g_fenceEvent = NULL;
 	HANDLE                  g_sharedTexture = NULL;
 	IDirect3DDevice9*       g_pD3D9Device = NULL;
 
@@ -302,17 +332,24 @@ void EndFrameFail() {
 	frameEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 
 	xrEndFrame(g_Session,&frameEndInfo);
+	semaphoreRender.release();
 }
 
 XrResult BeginFrame()
 {
-	//XrFrameBeginInfo frameBeginInfo{XR_TYPE_FRAME_BEGIN_INFO,nullptr};
+	semaphoreRender.acquire();
+
+	// If we somehow haven't finished copying the last frame we wait on that here
+	#ifdef _WIN32
+		if(g_d3d11Fence->GetCompletedValue() < g_d3d11FenceValue)
+		{
+			g_d3d11Fence->SetEventOnCompletion(g_d3d11FenceValue,g_fenceEvent);
+			WaitForSingleObject(g_fenceEvent,INFINITE);
+		}
+	#else
+	#endif
+
 	XrResult result = xrBeginFrame(g_Session, nullptr);
-	/*if(XR_FAILED(result))
-	{
-		EndFrameFail();
-		//LUA->ThrowError(GetResultString("XRMod Error: xrBeginFrame failed (%s)",result));
-	}*/
 
 	return result;
 }
@@ -359,6 +396,7 @@ const XrCompositionLayerProjection CreateLayer(XrView* viewInfo) {
 	return project;
 }
 
+IDirect3DQuery9* pEventQuery = nullptr;
 void EndFrame()
 {
 	if(!g_FramePoses[frameRender].valid)
@@ -366,6 +404,7 @@ void EndFrame()
 		EndFrameFail();
 		return;
 	}
+	g_FramePoses[frameRender].valid = false;
 
 	// Acquire swapchain image
 
@@ -391,11 +430,8 @@ void EndFrame()
 
 	// Flush to ensure texture results are immediately available
 	#ifdef _WIN32
-		IDirect3DQuery9* pEventQuery = nullptr;
-		g_pD3D9Device->CreateQuery(D3DQUERYTYPE_EVENT, &pEventQuery);
 		if (pEventQuery != nullptr)
 		{
-			pEventQuery->Issue(D3DISSUE_END);
 			while (pEventQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH) != S_OK);
 				pEventQuery->Release();
 		}
@@ -405,6 +441,9 @@ void EndFrame()
 	#ifdef _WIN32
 		g_d3d11DeviceContext->CopyResource(g_SwapchainImages[imageIndex].texture,g_d3d11Texture);
 		g_d3d11DeviceContext->Flush();
+
+		g_d3d11FenceValue++;
+		g_d3d11DeviceContext->Signal(g_d3d11Fence, g_d3d11FenceValue);
 	#else
 		// TODO: Do this for opengl too
 	#endif
@@ -432,6 +471,30 @@ void EndFrame()
 	{
 		//LUA->ThrowError(GetResultString("XRMod Error: xrEndFrame failed (%s)",result));
 	}
+
+	semaphoreRender.release();
+}
+
+void AdvanceRenderFrame()
+{
+	frameRender++;
+	if(frameRender >= g_FramePoses.size())
+		frameRender = 0;
+}
+
+void WaitThreadLoop()
+{
+	while (true)
+	{
+		semaphoreSignal.acquire();
+		
+		// End thread when session is destroyed
+		if(g_Session == XR_NULL_HANDLE)
+			break;
+
+		EndFrame();
+		AdvanceRenderFrame();
+	}
 }
 
 #ifdef _WIN32
@@ -444,12 +507,21 @@ void EndFrame()
 
 		if(g_SessionStarted)
 		{
-			EndFrame();
-			g_FramePoses[frameRender].valid = false;
+			// Create query right away to ensure it's directly after this frame's draw calls
+			#ifdef _WIN32
+				g_pD3D9Device->CreateQuery(D3DQUERYTYPE_EVENT, &pEventQuery);
+				if(pEventQuery != nullptr)
+					pEventQuery->Issue(D3DISSUE_END);
+			#else
+				// TODO: OpenGL equivalent of queries or fences
+			#endif
 
-			frameRender++;
-			if(frameRender >= g_FramePoses.size())
-				frameRender = 0;
+			if(g_bUseWaitThread)
+				semaphoreSignal.release();
+			else {
+				EndFrame();
+				AdvanceRenderFrame();
+			}
 		}
 
 		return result;
@@ -508,19 +580,34 @@ char* GetResultString(const char* form, XrResult result) {
 	return strBuffer;
 }
 
+// TODO: Optimize this
+Color textCol(211,81,255,255);
 void PrintConsoleText(char* str, GarrysMod::Lua::ILuaBase *LUA) {
-	LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
-	LUA->GetField(-1, "print");
+	LUA->GetField(GarrysMod::Lua::INDEX_GLOBAL, "MsgC");
+
+	LUA->CreateTable();
+
+	LUA->PushNumber(textCol[0]);
+	LUA->SetField(-2,"r");
+	LUA->PushNumber(textCol[1]);
+	LUA->SetField(-2,"g");
+	LUA->PushNumber(textCol[2]);
+	LUA->SetField(-2,"b");
+	LUA->PushNumber(textCol[3]);
+	LUA->SetField(-2,"a");
+
+	/*char newStr[MAX_STR_LEN];
+	strncpy(newStr,str,MAX_STR_LEN);
+	strncat(newStr,"\n",MAX_STR_LEN - strlen(str));*/
 	LUA->PushString(str);
-	LUA->PCall(1, 0, 0);
-	LUA->Pop();
+	LUA->PushString("\n");
+
+	LUA->PCall(3, 0, 0);
 }
 
 
-bool ContainsString(const char** array, const char* str)
+bool ContainsString(const char** array, int count, const char* str)
 {
-	int count = sizeof(array)/sizeof(array[0]);
-
 	for(int i = 0; i < count; i++)
 	{
 		if(strcmp(array[i],str) == 0)
@@ -530,9 +617,34 @@ bool ContainsString(const char** array, const char* str)
 	return false;
 }
 
-const char* requiredExtensions[] = {
-	//XR_EPIC_VIEW_CONFIGURATION_FOV_EXTENSION_NAME,
+XrResult AttemptCreateInstance(std::vector<const char*>* extensions, XrVersion apiVersion)
+{
+	XrInstanceCreateInfo createInfo{XR_TYPE_INSTANCE_CREATE_INFO,nullptr};
 
+	createInfo.enabledExtensionCount = (uint32_t) extensions->size();
+	createInfo.enabledExtensionNames = extensions->data();
+
+	std::vector<const char*> apiLayers = {};
+	#ifdef DEBUG
+		//apiLayers.push_back("XR_APILAYER_LUNARG_core_validation");
+	#endif
+	createInfo.enabledApiLayerCount = apiLayers.size();
+	createInfo.enabledApiLayerNames = apiLayers.data();
+
+	XrApplicationInfo appInfo;
+	appInfo.apiVersion = apiVersion;
+	strncpy(appInfo.applicationName, "Garry's Mod", XR_MAX_APPLICATION_NAME_SIZE);
+	appInfo.applicationVersion = 1;
+	strncpy(appInfo.engineName, "", XR_MAX_ENGINE_NAME_SIZE);
+	appInfo.engineVersion = 0;
+
+	createInfo.applicationInfo = appInfo;
+	createInfo.createFlags = 0;
+
+	return xrCreateInstance(&createInfo,&g_Instance);
+}
+
+const char* requiredExtensions[] = {
 	#ifdef _WIN32
 		XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
 		XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME,
@@ -553,23 +665,15 @@ const char* optionalExtensions[] = {
 };
 
 XrResult RefreshInstance(GarrysMod::Lua::ILuaBase *LUA = nullptr) {
-	XrInstanceCreateInfo createInfo{XR_TYPE_INSTANCE_CREATE_INFO,nullptr};
-
 	uint32_t extensionCount;
 	XrResult result = xrEnumerateInstanceExtensionProperties(nullptr,0,&extensionCount,nullptr);
 	if(XR_FAILED(result))
-	{
-		PrintConsoleText("Failed here! 4",LUA);
 		return result;
-	}
 
 	std::vector<XrExtensionProperties> extensionProperties(extensionCount, {XR_TYPE_EXTENSION_PROPERTIES,nullptr});
 	result = xrEnumerateInstanceExtensionProperties(nullptr,extensionCount,&extensionCount,extensionProperties.data());
 	if(XR_FAILED(result))
-	{
-		PrintConsoleText("Failed here! 3",LUA);
 		return result;
-	}
 
 	std::vector<const char*> extensions = {};
 	int numRequiredExts = sizeof(requiredExtensions)/sizeof(requiredExtensions[0]);
@@ -618,41 +722,35 @@ XrResult RefreshInstance(GarrysMod::Lua::ILuaBase *LUA = nullptr) {
 	}
 
 	if(requiredCount < numRequiredExts)
-	{
-		PrintConsoleText("Failed here! 2",LUA);
 		return XR_ERROR_EXTENSION_NOT_PRESENT;
+
+	g_bUse1_0 = false;
+	result = AttemptCreateInstance(&extensions,XR_CURRENT_API_VERSION);
+	if(XR_FAILED(result))
+	{
+		// Revert to 1.0 if the runtime doesn't support the current version
+		if(result == XR_ERROR_API_VERSION_UNSUPPORTED)
+		{
+			// 1.0 Doesn't have the grip_surface binding so we need the palm extension
+			extensions.push_back(XR_EXT_PALM_POSE_EXTENSION_NAME);
+			result = AttemptCreateInstance(&extensions,XR_API_VERSION_1_0);
+		}
+
+		if(XR_FAILED(result))
+			return result;
+		else
+			g_bUse1_0 = true;
 	}
 
 	const char** extArray = extensions.data();
-	g_supportsHandTracking = ContainsString(extArray, XR_EXT_HAND_TRACKING_EXTENSION_NAME);
-	g_supportsBodyTracking = ContainsString(extArray, XR_FB_BODY_TRACKING_EXTENSION_NAME) && ContainsString(extArray, XR_META_BODY_TRACKING_FULL_BODY_EXTENSION_NAME);
+	int count = extensions.size();
+	g_supportsHandTracking = ContainsString(extArray, count, XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+	g_supportsBodyTracking = ContainsString(extArray, count, XR_FB_BODY_TRACKING_EXTENSION_NAME)
+							&& ContainsString(extArray, count, XR_META_BODY_TRACKING_FULL_BODY_EXTENSION_NAME);
 
-	createInfo.enabledExtensionCount = (uint32_t) extensions.size();
-	createInfo.enabledExtensionNames = extArray;
-
-	std::vector<const char*> apiLayers = {};
-	#ifdef DEBUG
-		//apiLayers.push_back("XR_APILAYER_LUNARG_core_validation");
-	#endif
-	createInfo.enabledApiLayerCount = apiLayers.size();
-	createInfo.enabledApiLayerNames = apiLayers.data();
-
-	XrApplicationInfo appInfo;
-	appInfo.apiVersion = XR_CURRENT_API_VERSION;
-	strncpy(appInfo.applicationName, "Garry's Mod", XR_MAX_APPLICATION_NAME_SIZE);
-	appInfo.applicationVersion = 1;
-	strncpy(appInfo.engineName, "", XR_MAX_ENGINE_NAME_SIZE);
-	appInfo.engineVersion = 0;
-
-	createInfo.applicationInfo = appInfo;
-	createInfo.createFlags = 0;
-
-	result = xrCreateInstance(&createInfo,&g_Instance);
-	if(XR_FAILED(result))
-	{
-		PrintConsoleText("Failed here! 1",LUA);
-		return result;
-	}
+	char str[256];
+	snprintf(str,256,"Supports hands: %i",g_supportsHandTracking ? 1 : 0);
+	PrintConsoleText(str,LUA);
 	
 	SetupPrototypeFunctions();
 	return result;
@@ -749,6 +847,8 @@ bool CreateDebugMessenger(GarrysMod::Lua::ILuaBase *LUA)
 #endif
 
 void ClearSession(GarrysMod::Lua::ILuaBase *LUA) {
+	semaphoreRender.acquire();
+
 	if(g_Session != XR_NULL_HANDLE)
 	{
 		xrEndSession(g_Session);
@@ -847,10 +947,15 @@ void ClearSession(GarrysMod::Lua::ILuaBase *LUA) {
 
 	#ifdef _WIN32
 		if (g_d3d11Device != NULL) {
+			g_d3d11Fence->Release();
+			g_d3d11Fence = NULL;
 			g_d3d11DeviceContext->Release();
 			g_d3d11DeviceContext = NULL;
 			g_d3d11Device->Release();
 			g_d3d11Device = NULL;
+
+			CloseHandle(g_fenceEvent);
+			g_fenceEvent = NULL;
 		}
 
 		g_d3d11Texture = NULL;
@@ -863,10 +968,18 @@ void ClearSession(GarrysMod::Lua::ILuaBase *LUA) {
 		g_sharedTexture = GL_INVALID_VALUE;
 	#endif
 
+	semaphoreSignal.release();
+	if(g_tWaitThread.joinable())
+		g_tWaitThread.join();
+	
+	semaphoreSignal.try_acquire();
+
 	frameSimulate = 0;
 	frameRender = 0;
 
 	g_SystemId = XR_NULL_SYSTEM_ID;
+
+	semaphoreRender.release();
 }
 
 // Doesn't need changing
@@ -876,44 +989,8 @@ LUA_FUNCTION(GetVersion) {
 	return 1;
 }
 
-//typedef int ( *Fn )( IMaterialSystem * );
 // Done
 LUA_FUNCTION(IsHMDPresent) {
-	/*SourceSDK::FactoryLoader loader("materialsystem");
-	//g_pMatSys = ResolveSymbol<IMaterialSystem>( loader, symbol_MatSys );
-	//g_pMatSys = loader.GetInterface<IMaterialSystem>(MATERIAL_SYSTEM_INTERFACE_VERSION);
-	void* ptr = nullptr;// = ResolveSymbol( loader, symbol_MatSys );
-
-	if(ptr == nullptr)
-		ptr = loader.GetInterface<IMaterialSystem>(MATERIAL_SYSTEM_INTERFACE_VERSION);
-
-	if(!loader.IsValid())
-		PrintConsoleText("XRMod: Failed to acquire factory",LUA);
-
-	if(ptr == nullptr)
-		PrintConsoleText("XRMod: Failed to resolve symbol",LUA);
-	else
-	{
-		g_pMatSys = (IMaterialSystem*) ptr;
-		//g_pMatSys->SetShaderAPI(nullptr);
-		bool s = g_pMatSys != nullptr;//->Connect(loader.GetFactory());
-
-		if(s)
-			PrintConsoleText("yup",LUA);
-		else
-			PrintConsoleText("nope",LUA);
-
-		Fn fn = ((Fn**) ptr)[0][6];
-		fn(g_pMatSys);
-
-		char txt[MAX_STR_LEN];
-		snprintf(txt,MAX_STR_LEN,"Mode: %i / %i",Fn(),g_pMatSys->GetThreadMode());
-		PrintConsoleText(txt,LUA);
-
-
-		//g_pMatSys->SetThreadMode(MATERIAL_SINGLE_THREADED);
-	}*/
-
 	if(g_Instance == XR_NULL_HANDLE) {
 		XrResult result = RefreshInstance(LUA);
 		if(XR_FAILED(result))
@@ -961,8 +1038,26 @@ XrResult GetGraphicsRequirements()
 
 void AcquireRenderDevice(GarrysMod::Lua::ILuaBase *LUA) {
 	#ifdef _WIN32
-		if (D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, NULL, D3D11_SDK_VERSION, &g_d3d11Device, NULL, &g_d3d11DeviceContext) != S_OK)
+		ID3D11Device* baseDevice;
+		ID3D11DeviceContext* baseContext;
+		if (D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, NULL, D3D11_SDK_VERSION, &baseDevice, NULL, &baseContext) != S_OK)
 			LUA->ThrowError("D3D11CreateDevice failed");
+		
+		if(baseDevice->QueryInterface(__uuidof(ID3D11Device5), (void**) &g_d3d11Device) != S_OK)
+			LUA->ThrowError("ID3D11Device5 QueryInterface failed");
+		baseDevice->Release();
+
+		if(baseContext->QueryInterface(__uuidof(ID3D11DeviceContext4), (void**) &g_d3d11DeviceContext) != S_OK)
+			LUA->ThrowError("ID3D11DeviceContext4 QueryInterface failed");
+		baseContext->Release();
+
+		if(g_d3d11Device->CreateFence(0Ui64,D3D11_FENCE_FLAG_NONE,__uuidof(ID3D11Fence),(void**) &g_d3d11Fence) != S_OK)
+			LUA->ThrowError("ID3D11Device5::CreateFence failed");
+		g_d3d11FenceValue = 0Ui64;
+
+		g_fenceEvent = CreateEvent(NULL,FALSE,FALSE,NULL);
+		if(g_fenceEvent == NULL)
+			LUA->ThrowError("CreateEvent failed");
 	#else
 		// TODO: Is this needed for OpenGL?
 	#endif
@@ -970,44 +1065,65 @@ void AcquireRenderDevice(GarrysMod::Lua::ILuaBase *LUA) {
 
 void InitExtensions(GarrysMod::Lua::ILuaBase *LUA)
 {
-	XrSystemProperties properties{XR_TYPE_SYSTEM_PROPERTIES,nullptr};
+	XrSystemProperties properties{
+		XR_TYPE_SYSTEM_PROPERTIES,
+		nullptr,
+		XR_NULL_SYSTEM_ID,
+		0,
+		"",
+		{0,0,0},
+		{XR_FALSE,XR_FALSE}};
+	// Helper object to keep track of previous structure in the chain
+	XrBaseInStructure** nextptr = (XrBaseInStructure**) &properties.next;
+
+	XrSystemHandTrackingPropertiesEXT propertiesHand{XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT,nullptr,XR_FALSE};
+	if(g_supportsHandTracking)
+	{
+		*nextptr = (XrBaseInStructure*) &propertiesHand;
+		nextptr = (XrBaseInStructure**) &propertiesHand.next;
+	}
+
 	XrResult result = xrGetSystemProperties(g_Instance, g_SystemId, &properties);
 	if(XR_FAILED(xrGetSystemProperties))
 		LUA->ThrowError("XRMod Error: Failed to get system properties");
 	
-	// Helper object to keep track of previous structure in the chain
 	XrBaseInStructure* next = (XrBaseInStructure*) properties.next;
 
 	bool hasUpperBody = false;
 	bool hasLowerBody = false;
 
-	while(next != nullptr)
+	char str[256];
+	snprintf(str,256,"Hand tracking: %i",propertiesHand.supportsHandTracking);
+	PrintConsoleText(str,LUA);
+	g_hasHandTracking = propertiesHand.supportsHandTracking == XR_TRUE;
+
+	/*while(next != nullptr)
 	{
 		switch (next->type)
 		{
 			case XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT:
 			{
 				XrSystemHandTrackingPropertiesEXT* handProperties = (XrSystemHandTrackingPropertiesEXT*) next;
-				g_hasHandTracking = handProperties->supportsHandTracking;
+				g_hasHandTracking = handProperties->supportsHandTracking == XR_TRUE;
 				break;
 			}
 			// TODO: We might just want to remove this one
 			case XR_TYPE_SYSTEM_BODY_TRACKING_PROPERTIES_FB:
 			{
 				XrSystemBodyTrackingPropertiesFB* bodyProperties = (XrSystemBodyTrackingPropertiesFB*) next;
-				hasUpperBody = bodyProperties->supportsBodyTracking;
+				hasUpperBody = bodyProperties->supportsBodyTracking == XR_TRUE;
 				break;
 			}
 			case XR_TYPE_SYSTEM_PROPERTIES_BODY_TRACKING_FULL_BODY_META:
 			{
 				XrSystemPropertiesBodyTrackingFullBodyMETA* bodyProperties = (XrSystemPropertiesBodyTrackingFullBodyMETA*) next;
-				hasLowerBody = bodyProperties->supportsFullBodyTracking;
+				hasLowerBody = bodyProperties->supportsFullBodyTracking == XR_TRUE;
 				break;
 			}
 		}
 
 		next = (XrBaseInStructure*) next->next;
-	}
+	}*/
 
 	g_hasBodyTracking = hasUpperBody && hasLowerBody;
 
@@ -1164,6 +1280,9 @@ LUA_FUNCTION(Init) {
 
 	if(xrGetSystem(g_Instance,&getInfo,&g_SystemId) != XR_SUCCESS)
 		LUA->ThrowError("XRMod Error: Failed to get system info. Is your HMD connected?");
+	
+	if(g_bUseWaitThread)
+		g_tWaitThread = std::thread(&WaitThreadLoop);
 
 	#ifdef _WIN32
 		HMODULE hMod = GetModuleHandleA("shaderapidx9.dll");
@@ -1405,9 +1524,21 @@ LUA_FUNCTION(SuggestBindings) {
 
 			XrActionSuggestedBinding binding;
 			binding.action = act->handle;
-			binding.binding = CreateXrPath(LUA->GetString(-1));
-			bindings.push_back(binding);
 
+			char bind[XR_MAX_PATH_LENGTH];
+			strncpy(bind,LUA->GetString(-1),XR_MAX_PATH_LENGTH);
+
+			// 1.1 has grip_surface built-in, 1.0 has to get it from the palm pose extension
+			if(g_bUse1_0 && act->type == XR_ACTION_TYPE_POSE_INPUT)
+			{
+				if(strcmp(bind,"/user/hand/left/input/grip_surface/pose") == 0)
+					strncpy(bind,"/user/hand/left/input/palm_ext/pose",MAX_STR_LEN);
+				else if(strcmp(bind,"/user/hand/right/input/grip_surface/pose") == 0)
+					strncpy(bind,"/user/hand/right/input/palm_ext/pose",MAX_STR_LEN);
+			}
+			binding.binding = CreateXrPath(bind);
+
+			bindings.push_back(binding);
 			suggestedBindings.countSuggestedBindings++;
 		}
 
@@ -1804,28 +1935,134 @@ LUA_FUNCTION(GetPoses) {
 	return 1;
 }
 
-// TODO
-/*LUA_FUNCTION(GetHandPoses) {
-	if(!g_hasHandTracking)
+void QuatMul(XrQuaternionf& q0, XrQuaternionf& q1, XrQuaternionf& out)
+{
+	out.x =  q0.x * q1.w + q0.y * q1.z - q0.z * q1.y + q0.w * q1.x;
+	out.y = -q0.x * q1.z + q0.y * q1.w + q0.z * q1.x + q0.w * q1.y;
+	out.z =  q0.x * q1.y - q0.y * q1.x + q0.z * q1.w + q0.w * q1.z;
+	out.w = -q0.x * q1.x - q0.y * q1.y - q0.z * q1.z + q0.w * q1.w;
+}
+
+XrQuaternionf QuatMul(XrQuaternionf& q0, XrQuaternionf& q1)
+{
+	XrQuaternionf out;
+	QuatMul(q0,q1,out);
+	return out;
+}
+
+void QuatInvert(const XrQuaternionf& p, XrQuaternionf& q)
+{
+	q.x = -p.x;
+	q.y = -p.y;
+	q.z = -p.z;
+	q.w = p.w;
+
+	float magnitudeSqr = p.x * p.x + p.y * p.y + p.z * p.z + p.w * p.w;
+	if ( magnitudeSqr )
+	{
+		float inv = 1.0f / magnitudeSqr;
+		q.x *= inv;
+		q.y *= inv;
+		q.z *= inv;
+		q.w *= inv;
+	}
+}
+
+// 180 degrees
+const double minPitch = 0;
+const double maxPitch = 180.0 * DEG2RAD;
+const double pitchRange = maxPitch - minPitch;
+LUA_FUNCTION(GetFingercurls) {
+	if(!g_SessionStarted || !g_hasHandTracking)
 		return 0;
 
 	XrHandJointsLocateInfoEXT locateInfo{XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT,nullptr};
 	locateInfo.baseSpace = g_SpaceStage;
 	locateInfo.time = g_FrameState.predictedDisplayTime;
 
-	XrHandJointLocationsEXT locations{XR_TYPE_HAND_JOINT_LOCATIONS_EXT,nullptr};
-	xrLocateHandJointsEXT(g_handTrackerLeft,&locateInfo,&locations);
+	XrHandJointLocationEXT joints[XR_HAND_JOINT_COUNT_EXT];
 
-	XrHandJointLocationEXT* palm = &locations.jointLocations[XR_HAND_JOINT_PALM_EXT];
-	for(int i = 0; i < 5; i++)
+	XrHandJointLocationsEXT locations{
+		XR_TYPE_HAND_JOINT_LOCATIONS_EXT,
+		nullptr,
+		XR_FALSE,
+		XR_HAND_JOINT_COUNT_EXT,
+		joints
+	};
+
+	Quaternion inverse, offset;
+	for(int hand = 0; hand < 2; hand++)
 	{
-		XrHandJointLocationEXT* joint = &locations.jointLocations[XR_HAND_JOINT_INDEX_PROXIMAL_EXT];
-		VMatrix mtx;
-		ComposeTransform(joint->pose,&mtx);
-	}	
+		XrHandTrackerEXT tracker = hand == 0 ? g_handTrackerLeft : g_handTrackerRight;
+		XrResult result = xrLocateHandJointsEXT(tracker,&locateInfo,&locations);
+		if(XR_FAILED(result))
+			LUA->ThrowError(GetResultString("XRMod Error: Failed to locate hand joints (%s)",result));
 
-	return 0;
-}*/
+		if(!locations.isActive)
+		{
+			LUA->PushNumber(0.0);
+			LUA->PushNumber(0.0);
+			LUA->PushNumber(0.0);
+			LUA->PushNumber(0.0);
+			LUA->PushNumber(0.0);
+			continue;
+		}
+
+		// Proximal joint
+		XrHandJointLocationEXT* j1;
+		// Tip joint
+		XrHandJointLocationEXT* j2;
+		for(int i = 0; i < 5; i++)
+		{
+			if(i == 0)
+			{
+				j1 = &joints[XR_HAND_JOINT_THUMB_PROXIMAL_EXT];
+				j2 = &joints[XR_HAND_JOINT_THUMB_TIP_EXT];
+			}
+			else
+			{
+				j1 = &joints[XR_HAND_JOINT_THUMB_METACARPAL_EXT + 5 * i];
+				j2 = &joints[XR_HAND_JOINT_THUMB_TIP_EXT + 5 * i];
+			}
+			if(j1->locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT == 0 ||
+				j2->locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT == 0)
+			{
+				LUA->PushNumber(0.0);
+				continue;
+			}
+
+			/*QuatInvert(j1->pose.orientation,inverse);
+			QuatMul(inverse,j2->pose.orientation,offset);*/
+			Quaternion q1 = {
+				j1->pose.orientation.x,
+				j1->pose.orientation.y,
+				j1->pose.orientation.z,
+				j1->pose.orientation.w
+			};
+			QuaternionInvert(q1,inverse);
+			q1 = {
+				j2->pose.orientation.x,
+				j2->pose.orientation.y,
+				j2->pose.orientation.z,
+				j2->pose.orientation.w
+			};
+			QuaternionMult(q1,inverse,offset);
+
+			double pitch = asin(-(( 2.0f * offset.x * offset.z ) - ( 2.0f * offset.w * offset.y ) ));
+			if(i == 1)
+			{
+				char str[MAX_STR_LEN];
+				snprintf(str,MAX_STR_LEN,"Pitch: %d",pitch);
+				PrintConsoleText(str,LUA);
+			}
+
+			double curl = (pitch-minPitch)/pitchRange;
+			LUA->PushNumber(curl);
+		}
+	}
+
+	return 10;
+}
 
 LUA_FUNCTION(GetBodyTrackers) {
 	if(!g_hasBodyTracking)
@@ -2400,7 +2637,166 @@ LUA_FUNCTION(GetInteractionProfile) {
 	return 1;
 }
 
+
+#ifdef DEBUG_SYMBOLS
+#define rangeStart 87
+#define rangeEnd 91
+#define RANGE 1+rangeEnd-rangeStart
+#define MATSYS_CREATERENDERTARGET 89
+int index;
+int hits;
+
+std::vector<std::string> names;
+Detouring::Hook hook;
+ITexture* DetourHook(IMaterialSystem* thisTemp, char *pRTName,				// Pass in NULL here for an unnamed render target.
+				int w, 
+				int h, 
+				RenderTargetSizeMode_t sizeMode,	// Controls how size is generated (and regenerated on video mode change).
+				ImageFormat format, 
+				MaterialRenderTargetDepth_t depth = MATERIAL_RT_DEPTH_SHARED, 
+				unsigned int textureFlags = TEXTUREFLAGS_CLAMPS | TEXTUREFLAGS_CLAMPT,
+				unsigned int renderTargetFlags = 0)
+{
+	//index = i;
+	if(thisTemp == g_pMatSys && w == 64 && h == 64)
+	{
+		hits++;
+		if(pRTName != nullptr)
+			names.push_back(std::string(pRTName));
+	}
+	return hook.GetTrampoline<CreateNamedRenderTargetTextureEx>()(thisTemp,pRTName,w,h,sizeMode,format,depth,textureFlags,renderTargetFlags);
+}
+
+void FrameHook(float frameTime)
+{
+	//Sleep(1);
+	return hook.GetTrampoline<BeginFrameFunc>()(frameTime);
+}
+
+void ScanForFunction(GarrysMod::Lua::ILuaBase *LUA)
+{
+	SourceSDK::FactoryLoader loader("materialsystem");
+	g_pMatSys = loader.GetInterface<IMaterialSystem>(MATERIAL_SYSTEM_INTERFACE_VERSION);
+
+	if(!loader.IsValid())
+		PrintConsoleText("XRMod: Failed to acquire factory",LUA);
+
+	if(g_pMatSys == nullptr)
+		PrintConsoleText("XRMod: Failed to acquire g_pMaterialSystem",LUA);
+	else
+	{
+		index = -1;
+		hits = 0;
+		int attempts = 0;
+		int errcode;
+		names.clear();
+		for(int i = rangeStart; i <= rangeEnd; i++)
+		{
+			CreateNamedRenderTargetTextureEx fn = ((CreateNamedRenderTargetTextureEx**) g_pMatSys)[0][i];
+
+			hook.Create(fn, &DetourHook);
+			if(hook.IsValid())
+			{
+				hook.Enable();
+				attempts++;
+
+				char name[MAX_STR_LEN];
+				snprintf(name,MAX_STR_LEN,"jeff_%i",i);
+
+				LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
+				LUA->GetField(-1, "GetRenderTargetEx");
+				LUA->Remove(-2);
+				LUA->PushString(name);
+				LUA->PushNumber(64.0);
+				LUA->PushNumber(64.0);
+				LUA->PushNumber(0.0);
+				LUA->PushNumber(0.0);
+				LUA->PushNumber(0.0);
+				LUA->PushNumber(0.0);
+				LUA->PushNumber(-1.0);
+				errcode = LUA->PCall(8, 1, 0);
+
+				hook.Destroy();
+				
+				if(hits > 0)
+				{
+					index = i;
+					uint64_t size = (uint64_t)((uint8_t**) g_pMatSys)[0][i+1] - (uint64_t)((uint8**) g_pMatSys)[0][i];
+					snprintf(name,MAX_STR_LEN,"%i hits on index %i, size: %i",hits,i,(int)size);
+					hits = 0;
+					PrintConsoleText(name,LUA);
+
+					for(int n = 0; n < names.size(); n++)
+					{
+						PrintConsoleText(names[n].data(),LUA);
+					}
+					names.clear();
+
+					uint8_t* p = (uint8_t*) fn;
+					strncpy(name,"Bytes: ",MAX_STR_LEN);
+					for(int b = 0; b < 24; b++)
+					{
+						std::string byte = std::format("\\x{:x}",p[b]);
+						strncat(name,byte.data(),MAX_STR_LEN);
+					}
+					PrintConsoleText(name,LUA);
+					break;
+				}
+			}
+		}
+
+
+		/*for(int i = rangeEnd; i >= rangeStart; i--)
+		{
+			if(hooks[i].IsValid())
+				hooks[i].Destroy();
+		}*/
+
+		char txt[MAX_STR_LEN];
+		snprintf(txt,MAX_STR_LEN,"Error: %i Attempts: %i Index: %i",errcode,attempts,index);
+		PrintConsoleText(txt,LUA);
+
+		BeginFrameFunc fn = ((BeginFrameFunc**) g_pMatSys)[0][MATSYS_CREATERENDERTARGET-48];
+		hook.Create(fn,&FrameHook);
+		if(hook.IsValid())
+			hook.Enable();
+
+		//g_pMatSys->SetThreadMode(MATERIAL_SINGLE_THREADED);
+	}
+}
+#endif // DEBUG_SYMBOLS
+
+void AcquireFunctionPointers(GarrysMod::Lua::ILuaBase *LUA)
+{
+	SourceSDK::FactoryLoader loader("materialsystem");
+	g_pMatSys = loader.GetInterface<IMaterialSystem>(MATERIAL_SYSTEM_INTERFACE_VERSION);
+
+	if(!loader.IsValid())
+		PrintConsoleText("XRMod: Failed to acquire factory",LUA);
+
+	if(g_pMatSys == nullptr)
+		PrintConsoleText("XRMod: Failed to acquire g_pMaterialSystem",LUA);
+	else
+	{
+		SymbolFinder symfinder;
+		auto pointer = reinterpret_cast<uint8_t *>( symfinder.Resolve(loader.GetModule(),
+			sym_CreateRenderTarget.name.c_str(), sym_CreateRenderTarget.length ) );
+		
+		if (pointer != nullptr)
+			fn_CreateNamedRenderTargetTextureEx = (CreateNamedRenderTargetTextureEx) pointer;
+		
+		ITexture* tex = fn_CreateNamedRenderTargetTextureEx(g_pMatSys,"duh",
+		64,64,RT_SIZE_DEFAULT,IMAGE_FORMAT_RGBA8888,MATERIAL_RT_DEPTH_SHARED,0,0);
+		if(tex != nullptr)
+			PrintConsoleText("It lives",LUA);
+	}
+}
+
 GMOD_MODULE_OPEN(){
+	#ifdef DEBUG_SYMBOLS
+		ScanForFunction(LUA);
+	#endif
+	AcquireFunctionPointers(LUA);
 	LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
 	LUA->GetField(-1, "vrmod");
 
@@ -2466,6 +2862,9 @@ GMOD_MODULE_OPEN(){
 		LUA->PushCFunction(GetInteractionProfile);
 		LUA->SetField(-2, "GetInteractionProfile");
 
+		LUA->PushCFunction(GetFingercurls);
+		LUA->SetField(-2, "GetFingercurls");
+
 		LUA->SetField(-2, "vrmod");
 
 	LUA->Pop();
@@ -2497,6 +2896,10 @@ GMOD_MODULE_CLOSE(){
 	}
 
 	g_pMatSys = nullptr;
+	#ifdef DEBUG_SYMBOLS
+	if(hook.IsValid())
+		hook.Destroy();
+	#endif
 
 	#ifdef DEBUG
 	debugLuaHandle = nullptr;
